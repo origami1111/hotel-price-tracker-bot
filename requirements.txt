@@ -1,0 +1,7 @@
+python-telegram-bot==21.0
+aiohttp==3.10.0
+beautifulsoup4==4.12.3
+apscheduler==3.10.4
+requests==2.32.0
+httpx>=0.26.0
+httpcore>=1.0.9
