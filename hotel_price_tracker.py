@@ -13,6 +13,7 @@ from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import logging
 import re
+from playwright.async_api import async_playwright
 
 # Настройка логирования
 logging.basicConfig(
