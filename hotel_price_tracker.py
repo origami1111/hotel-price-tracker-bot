@@ -89,7 +89,7 @@ async def fetch_hotel_price(session, url):
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
-        async with session.get(url, headers=headers, timeout=10) as response:
+        async with session.get(url, headers=headers, timeout=60) as response:
             if response.status == 200:
                 html = await response.text()
                 soup = BeautifulSoup(html, 'html.parser')
@@ -97,7 +97,7 @@ async def fetch_hotel_price(session, url):
                 # Попытаемся найти цену разными способами
                 price_elem = None
                 
-                #  Искать по найденному селектору jsTourPrice
+                # ✅ СПОСОБ 1: Искать по найденному селектору jsTourPrice
                 class_names = [
                     'jsTourPrice',      # ← Основной селектор (найден!)
                     'info-box__price',  # ← Альтернативный
@@ -113,10 +113,25 @@ async def fetch_hotel_price(session, url):
                         break
                 
                 if price_elem:
-                    price_text = price_elem.get_text(strip=True)
-                    logger.info(f"Найденный текст цены: {price_text}")
+                    # 🔧 ИСПРАВЛЕНИЕ: Правильно извлечь текст со всеми вложенными элементами
+                    # Для случаев типа: <div class="jsTourPrice"><span>100 967</span> грн</div>
                     
-                    # Извлеки только числа (числа и точки/запятые, удаляя пробелы)
+                    # Способ 1: Получить весь текст, включая вложенные элементы
+                    price_text = price_elem.get_text()  # БЕЗ strip=True, чтобы не потерять пробелы
+                    logger.info(f"Найденный текст цены (raw): '{price_text}'")
+                    
+                    # Способ 2: Если текст пустой, попробуй найти span внутри
+                    if not price_text.strip():
+                        span = price_elem.find('span')
+                        if span:
+                            price_text = span.get_text(strip=True)
+                            logger.info(f"Найден span с текстом: '{price_text}'")
+                    
+                    # Способ 3: Очистить текст от переносов строк и множественных пробелов
+                    price_text = ' '.join(price_text.split())  # Объединить разбитый текст
+                    logger.info(f"Очищенный текст цены: '{price_text}'")
+                    
+                    # Извлеки только числа (числа и точки/запятые, удаляя ВСЕ пробелы)
                     price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
                     
                     if price:
@@ -125,7 +140,7 @@ async def fetch_hotel_price(session, url):
                         logger.info(f"✅ Извлеченная цена: {price}")
                         return price
                     else:
-                        logger.warning(f"Не удалось извлечь цифры из текста: {price_text}")
+                        logger.warning(f"Не удалось извлечь цифры из текста: '{price_text}'")
                 else:
                     logger.warning(f"Не найден элемент с ценой на странице {url}")
                 
