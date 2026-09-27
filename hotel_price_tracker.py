@@ -96,23 +96,47 @@ async def fetch_hotel_price(session, url):
                 html = await response.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # Ищем цену - адаптируй селектор под реальную структуру сайта
-                price_elem = soup.find('div', {'class': 'price'})
-                if not price_elem:
-                    price_elem = soup.find('span', {'class': 'price'})
-                if not price_elem:
-                    price_elem = soup.find('div', {'class': 'cost'})
-                if not price_elem:
-                    price_elem = soup.find('div', {'class': 'info-box__price'})
+                # Попытаемся найти цену разными способами
+                price_elem = None
+                
+                # ✅ СПОСОБ 1: Искать по найденному селектору jsTourPrice
+                class_names = [
+                    'jsTourPrice',      # ← Основной селектор (найден!)
+                    'info-box__price',  # ← Альтернативный
+                    'price', 'cost', 'hotel-price', 'room-price', 
+                    'price-tag', 'room-cost', 'total-price', 'final-price',
+                    'price-value', 'current-price', 'price-amount'
+                ]
+                
+                for class_name in class_names:
+                    price_elem = soup.find(class_=class_name)
+                    if price_elem:
+                        logger.info(f"✅ Найдена цена по классу: {class_name}")
+                        break
                 
                 if price_elem:
                     price_text = price_elem.get_text(strip=True)
-                    # Извлеки только числа
-                    price = ''.join(filter(lambda x: x.isdigit() or x == '.', price_text))
-                    return price if price else None
+                    logger.info(f"Найденный текст цены: {price_text}")
+                    
+                    # Извлеки только числа (числа и точки/запятые, удаляя пробелы)
+                    price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
+                    
+                    if price:
+                        # Нормализуй запятую в точку
+                        price = price.replace(',', '.')
+                        logger.info(f"✅ Извлеченная цена: {price}")
+                        return price
+                    else:
+                        logger.warning(f"Не удалось извлечь цифры из текста: {price_text}")
+                else:
+                    logger.warning(f"Не найден элемент с ценой на странице {url}")
+                
+                return None
         return None
     except Exception as e:
         logger.error(f"Ошибка при получении цены: {e}")
+        import traceback
+        logger.error(traceback.format_exc())
         return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
