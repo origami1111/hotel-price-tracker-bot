@@ -3,5 +3,3 @@ aiohttp==3.9.5
 beautifulsoup4==4.12.3
 apscheduler==3.10.4
 requests==2.32.0
-selenium==4.15.2
-webdriver-manager==4.0.1
