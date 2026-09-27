@@ -9,15 +9,10 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 import logging
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.chrome.options import Options
-from webdriver_manager.chrome import ChromeDriverManager
-from selenium.webdriver.chrome.service import Service
-import time
+import re
 
 # Настройка логирования
 logging.basicConfig(
@@ -91,129 +86,130 @@ class HotelPriceTracker:
 
 tracker = HotelPriceTracker()
 
-def fetch_hotel_price_selenium(url):
-    """Получить цену отеля используя Selenium (для JavaScript контента)"""
-    driver = None
-    try:
-        logger.info(f"🌐 Загружаю страницу Selenium: {url}")
-        
-        # Настройки Chrome для headless режима
-        chrome_options = Options()
-        chrome_options.add_argument("--headless")
-        chrome_options.add_argument("--no-sandbox")
-        chrome_options.add_argument("--disable-dev-shm-usage")
-        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
-        chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
-        
-        # Создать драйвер
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=chrome_options)
-        
-        # Загрузить страницу с таймаутом
-        driver.set_page_load_timeout(60)
-        driver.get(url)
-        
-        # Подождать загрузки цены (max 10 секунд)
-        logger.info("⏳ Жду загрузки цены...")
-        wait = WebDriverWait(driver, 60)
-        
-        # Попробуй найти элемент с ценой
-        price_elem = None
-        selectors = [
-            ('class name', 'jsTourPrice'),
-            ('class name', 'info-box__price'),
-            ('xpath', "//*[contains(@class, 'jsTourPrice')]//span"),
-            ('xpath', "//div[@class='info-box__price']"),
-            ('xpath', "//*[contains(text(), 'грн')]"),
-        ]
-        
-        for selector_type, selector_value in selectors:
-            try:
-                if selector_type == 'class name':
-                    price_elem = wait.until(
-                        EC.presence_of_element_located((By.CLASS_NAME, selector_value))
-                    )
-                elif selector_type == 'xpath':
-                    price_elem = wait.until(
-                        EC.presence_of_element_located((By.XPATH, selector_value))
-                    )
-                
-                if price_elem:
-                    logger.info(f"✅ Найден элемент по селектору: {selector_type}='{selector_value}'")
-                    break
-            except:
-                continue
-        
-        if price_elem:
-            price_text = price_elem.text.strip()
-            logger.info(f"Найденный текст цены: '{price_text}'")
-            
-            # Извлеки только числа
-            price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
-            
-            if price:
-                price = price.replace(',', '.')
-                logger.info(f"✅ Извлеченная цена (Selenium): {price}")
-                return price
-            else:
-                logger.warning(f"Не удалось извлечь цифры из текста: '{price_text}'")
-        else:
-            logger.warning(f"Не найден элемент с ценой на странице {url}")
-        
-        return None
-        
-    except Exception as e:
-        logger.error(f"Ошибка при получении цены (Selenium): {e}")
-        import traceback
-        logger.error(traceback.format_exc())
-        return None
-    finally:
-        if driver:
-            try:
-                driver.quit()
-            except:
-                pass
-
 async def fetch_hotel_price(session, url):
-    """Получить цену отеля с сайта (основная функция)"""
+    """Получить цену отеля - парсит JSON данные со страницы"""
     try:
-        # Сначала попробуй Selenium для JavaScript контента
-        logger.info("📡 Пытаюсь получить цену через Selenium...")
-        price = fetch_hotel_price_selenium(url)
-        
-        if price:
-            logger.info(f"✅ Цена получена через Selenium: {price}")
-            return price
-        
-        logger.info("⚠️ Selenium не дал результата, пробую старый метод...")
-        
-        # Фолбэк: Используй aiohttp если Selenium не сработал
         headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
         }
+        
+        logger.info(f"📡 Загружаю страницу: {url}")
+        
         async with session.get(url, headers=headers, timeout=60) as response:
             if response.status == 200:
                 html = await response.text()
+                logger.info("✅ Страница загружена")
+                
+                # СПОСОБ 1: Ищем цену в HTML прямо
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # Ищем цену по классу jsTourPrice
+                # Ищем элемент с классом jsTourPrice
                 price_elem = soup.find(class_='jsTourPrice')
                 
                 if price_elem:
                     price_text = price_elem.get_text()
+                    logger.info(f"Найден элемент jsTourPrice, текст: '{price_text}'")
+                    
+                    # Очистить пробелы
+                    price_text = ' '.join(price_text.split())
+                    
+                    # Извлечь числа
                     price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
                     
                     if price:
                         price = price.replace(',', '.')
-                        logger.info(f"✅ Цена получена через BeautifulSoup: {price}")
+                        logger.info(f"✅ Цена найдена (способ 1): {price}")
                         return price
-        
+                
+                # СПОСОБ 2: Ищем в JavaScript переменных
+                logger.info("Способ 1 не сработал, пробую парсить JS переменные...")
+                
+                # Ищем переменные типа window.tourPrice = ...
+                patterns = [
+                    r'tourPrice["\']?\s*[=:]\s*["\']?(\d+(?:[.,]\d+)?)',
+                    r'price["\']?\s*[=:]\s*["\']?(\d+(?:[.,]\d+)?)',
+                    r'cost["\']?\s*[=:]\s*["\']?(\d+(?:[.,]\d+)?)',
+                    r'"price"\s*[=:]\s*(\d+(?:[.,]\d+)?)',
+                ]
+                
+                for pattern in patterns:
+                    matches = re.findall(pattern, html, re.IGNORECASE)
+                    if matches:
+                        price = matches[0].replace(',', '.')
+                        logger.info(f"✅ Цена найдена (способ 2, паттерн {pattern}): {price}")
+                        return price
+                
+                # СПОСОБ 3: Ищем JSON данные в script тегах
+                logger.info("Способ 2 не сработал, пробую парсить JSON из скриптов...")
+                
+                scripts = soup.find_all('script', type='application/json')
+                for script in scripts:
+                    try:
+                        data = json.loads(script.string)
+                        # Рекурсивно ищем в JSON
+                        price = find_price_in_json(data)
+                        if price:
+                            logger.info(f"✅ Цена найдена (способ 3): {price}")
+                            return price
+                    except:
+                        pass
+                
+                # СПОСОБ 4: Последний шанс - ищем любое число с валютой
+                logger.info("Способ 3 не сработал, ищу последним способом...")
+                
+                for elem in soup.find_all(['div', 'span', 'p', 'h3', 'h4']):
+                    text = elem.get_text(strip=True)
+                    if text and any(curr in text for curr in ['грн', 'UAH', 'uah']):
+                        if any(char.isdigit() for char in text):
+                            # Очень вероятно это цена
+                            price = ''.join(filter(lambda x: x.isdigit() or x in ',.', text.replace(' ', '')))
+                            if price and len(price) > 2:  # Минимум 3 цифры
+                                price = price.replace(',', '.')
+                                logger.info(f"✅ Цена найдена (способ 4): {price}")
+                                return price
+                
+                logger.warning("❌ Не удалось найти цену ни одним способом")
+                return None
+            else:
+                logger.error(f"❌ Ошибка HTTP {response.status}")
+                return None
+                
+    except asyncio.TimeoutError:
+        logger.error("❌ Таймаут при загрузке страницы")
         return None
     except Exception as e:
-        logger.error(f"Ошибка при получении цены: {e}")
+        logger.error(f"❌ Ошибка при получении цены: {e}")
         import traceback
         logger.error(traceback.format_exc())
         return None
+
+def find_price_in_json(data, max_depth=5):
+    """Рекурсивно ищет цену в JSON данных"""
+    if max_depth <= 0:
+        return None
+    
+    if isinstance(data, dict):
+        # Ищем ключи с "price", "cost", "tour"
+        for key, value in data.items():
+            if any(word in str(key).lower() for word in ['price', 'cost', 'tour', 'total', 'amount']):
+                if isinstance(value, (int, float)):
+                    return str(value)
+                elif isinstance(value, str) and value.replace('.', '').replace(',', '').isdigit():
+                    return value
+            # Рекурсивно ищем глубже
+            result = find_price_in_json(value, max_depth - 1)
+            if result:
+                return result
+    
+    elif isinstance(data, list):
+        for item in data:
+            result = find_price_in_json(item, max_depth - 1)
+            if result:
+                return result
+    
+    return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
