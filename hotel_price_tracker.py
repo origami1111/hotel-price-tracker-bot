@@ -10,6 +10,14 @@ from telegram.ext import (
     ContextTypes, filters
 )
 import logging
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from selenium.webdriver.chrome.service import Service
+import time
 
 # Настройка логирования
 logging.basicConfig(
@@ -83,9 +91,103 @@ class HotelPriceTracker:
 
 tracker = HotelPriceTracker()
 
-async def fetch_hotel_price(session, url):
-    """Получить цену отеля с сайта"""
+def fetch_hotel_price_selenium(url):
+    """Получить цену отеля используя Selenium (для JavaScript контента)"""
+    driver = None
     try:
+        logger.info(f"🌐 Загружаю страницу Selenium: {url}")
+        
+        # Настройки Chrome для headless режима
+        chrome_options = Options()
+        chrome_options.add_argument("--headless")
+        chrome_options.add_argument("--no-sandbox")
+        chrome_options.add_argument("--disable-dev-shm-usage")
+        chrome_options.add_argument("--disable-blink-features=AutomationControlled")
+        chrome_options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36")
+        
+        # Создать драйвер
+        service = Service(ChromeDriverManager().install())
+        driver = webdriver.Chrome(service=service, options=chrome_options)
+        
+        # Загрузить страницу с таймаутом
+        driver.set_page_load_timeout(60)
+        driver.get(url)
+        
+        # Подождать загрузки цены (max 10 секунд)
+        logger.info("⏳ Жду загрузки цены...")
+        wait = WebDriverWait(driver, 60)
+        
+        # Попробуй найти элемент с ценой
+        price_elem = None
+        selectors = [
+            ('class name', 'jsTourPrice'),
+            ('class name', 'info-box__price'),
+            ('xpath', "//*[contains(@class, 'jsTourPrice')]//span"),
+            ('xpath', "//div[@class='info-box__price']"),
+            ('xpath', "//*[contains(text(), 'грн')]"),
+        ]
+        
+        for selector_type, selector_value in selectors:
+            try:
+                if selector_type == 'class name':
+                    price_elem = wait.until(
+                        EC.presence_of_element_located((By.CLASS_NAME, selector_value))
+                    )
+                elif selector_type == 'xpath':
+                    price_elem = wait.until(
+                        EC.presence_of_element_located((By.XPATH, selector_value))
+                    )
+                
+                if price_elem:
+                    logger.info(f"✅ Найден элемент по селектору: {selector_type}='{selector_value}'")
+                    break
+            except:
+                continue
+        
+        if price_elem:
+            price_text = price_elem.text.strip()
+            logger.info(f"Найденный текст цены: '{price_text}'")
+            
+            # Извлеки только числа
+            price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
+            
+            if price:
+                price = price.replace(',', '.')
+                logger.info(f"✅ Извлеченная цена (Selenium): {price}")
+                return price
+            else:
+                logger.warning(f"Не удалось извлечь цифры из текста: '{price_text}'")
+        else:
+            logger.warning(f"Не найден элемент с ценой на странице {url}")
+        
+        return None
+        
+    except Exception as e:
+        logger.error(f"Ошибка при получении цены (Selenium): {e}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
+    finally:
+        if driver:
+            try:
+                driver.quit()
+            except:
+                pass
+
+async def fetch_hotel_price(session, url):
+    """Получить цену отеля с сайта (основная функция)"""
+    try:
+        # Сначала попробуй Selenium для JavaScript контента
+        logger.info("📡 Пытаюсь получить цену через Selenium...")
+        price = fetch_hotel_price_selenium(url)
+        
+        if price:
+            logger.info(f"✅ Цена получена через Selenium: {price}")
+            return price
+        
+        logger.info("⚠️ Selenium не дал результата, пробую старый метод...")
+        
+        # Фолбэк: Используй aiohttp если Selenium не сработал
         headers = {
             'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
         }
@@ -94,57 +196,18 @@ async def fetch_hotel_price(session, url):
                 html = await response.text()
                 soup = BeautifulSoup(html, 'html.parser')
                 
-                # Попытаемся найти цену разными способами
-                price_elem = None
-                
-                # ✅ СПОСОБ 1: Искать по найденному селектору jsTourPrice
-                class_names = [
-                    'jsTourPrice',      # ← Основной селектор (найден!)
-                    'info-box__price',  # ← Альтернативный
-                    'price', 'cost', 'hotel-price', 'room-price', 
-                    'price-tag', 'room-cost', 'total-price', 'final-price',
-                    'price-value', 'current-price', 'price-amount'
-                ]
-                
-                for class_name in class_names:
-                    price_elem = soup.find(class_=class_name)
-                    if price_elem:
-                        logger.info(f"✅ Найдена цена по классу: {class_name}")
-                        break
+                # Ищем цену по классу jsTourPrice
+                price_elem = soup.find(class_='jsTourPrice')
                 
                 if price_elem:
-                    # 🔧 ИСПРАВЛЕНИЕ: Правильно извлечь текст со всеми вложенными элементами
-                    # Для случаев типа: <div class="jsTourPrice"><span>100 967</span> грн</div>
-                    
-                    # Способ 1: Получить весь текст, включая вложенные элементы
-                    price_text = price_elem.get_text()  # БЕЗ strip=True, чтобы не потерять пробелы
-                    logger.info(f"Найденный текст цены (raw): '{price_text}'")
-                    
-                    # Способ 2: Если текст пустой, попробуй найти span внутри
-                    if not price_text.strip():
-                        span = price_elem.find('span')
-                        if span:
-                            price_text = span.get_text(strip=True)
-                            logger.info(f"Найден span с текстом: '{price_text}'")
-                    
-                    # Способ 3: Очистить текст от переносов строк и множественных пробелов
-                    price_text = ' '.join(price_text.split())  # Объединить разбитый текст
-                    logger.info(f"Очищенный текст цены: '{price_text}'")
-                    
-                    # Извлеки только числа (числа и точки/запятые, удаляя ВСЕ пробелы)
+                    price_text = price_elem.get_text()
                     price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
                     
                     if price:
-                        # Нормализуй запятую в точку
                         price = price.replace(',', '.')
-                        logger.info(f"✅ Извлеченная цена: {price}")
+                        logger.info(f"✅ Цена получена через BeautifulSoup: {price}")
                         return price
-                    else:
-                        logger.warning(f"Не удалось извлечь цифры из текста: '{price_text}'")
-                else:
-                    logger.warning(f"Не найден элемент с ценой на странице {url}")
-                
-                return None
+        
         return None
     except Exception as e:
         logger.error(f"Ошибка при получении цены: {e}")
