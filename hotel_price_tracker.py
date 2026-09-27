@@ -1,7 +1,6 @@
 import os
 import json
 import asyncio
-import aiohttp
 from datetime import datetime
 from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
@@ -12,7 +11,6 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import logging
-import re
 from playwright.async_api import async_playwright
 
 # Настройка логирования
@@ -87,130 +85,82 @@ class HotelPriceTracker:
 
 tracker = HotelPriceTracker()
 
-async def fetch_hotel_price(session, url):
-    """Получить цену отеля - парсит JSON данные со страницы"""
+async def fetch_hotel_price(url):
+    """Получить цену отеля - использует Playwright для загрузки и ожидания JavaScript"""
+    browser = None
     try:
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept-Language': 'uk-UA,uk;q=0.9,en-US;q=0.8',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-        }
+        logger.info(f"📡 Загружаю страницу Playwright: {url}")
         
-        logger.info(f"📡 Загружаю страницу: {url}")
-        
-        async with session.get(url, headers=headers, timeout=60) as response:
-            if response.status == 200:
-                html = await response.text()
+        async with async_playwright() as p:
+            # Запусти браузер в headless режиме
+            browser = await p.chromium.launch(
+                headless=True, 
+                args=['--no-sandbox', '--disable-dev-shm-usage']
+            )
+            page = await browser.new_page()
+            
+            try:
+                # Загрузи страницу
+                await page.goto(url, wait_until='networkidle')
                 logger.info("✅ Страница загружена")
                 
-                # СПОСОБ 1: Ищем цену в HTML прямо
-                soup = BeautifulSoup(html, 'html.parser')
+                # КЛЮЧЕВОЙ МОМЕНТ: Ждем пока цена не загрузится в элемент
+                # Сначала ждем чтобы элемент появился
+                logger.info("⏳ Жду появления элемента .jsTourPrice...")
+                try:
+                    await page.wait_for_selector('.jsTourPrice', timeout=10000)
+                    logger.info("✅ Элемент .jsTourPrice найден")
+                except:
+                    logger.warning("⚠️ Элемент .jsTourPrice не найден, попробую искать альтернативные селекторы")
                 
-                # Ищем элемент с классом jsTourPrice
-                price_elem = soup.find(class_='jsTourPrice')
-                
-                if price_elem:
-                    price_text = price_elem.get_text()
-                    logger.info(f"Найден элемент jsTourPrice, текст: '{price_text}'")
-                    
-                    # Очистить пробелы
-                    price_text = ' '.join(price_text.split())
-                    
-                    # Извлечь числа
-                    price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
-                    
-                    if price:
-                        price = price.replace(',', '.')
-                        logger.info(f"✅ Цена найдена (способ 1): {price}")
-                        return price
-                
-                # СПОСОБ 2: Ищем в JavaScript переменных
-                logger.info("Способ 1 не сработал, пробую парсить JS переменные...")
-                
-                # Ищем переменные типа window.tourPrice = ...
-                patterns = [
-                    r'tourPrice["\']?\s*[=:]\s*["\']?(\d+(?:[.,]\d+)?)',
-                    r'price["\']?\s*[=:]\s*["\']?(\d+(?:[.,]\d+)?)',
-                    r'cost["\']?\s*[=:]\s*["\']?(\d+(?:[.,]\d+)?)',
-                    r'"price"\s*[=:]\s*(\d+(?:[.,]\d+)?)',
-                ]
-                
-                for pattern in patterns:
-                    matches = re.findall(pattern, html, re.IGNORECASE)
-                    if matches:
-                        price = matches[0].replace(',', '.')
-                        logger.info(f"✅ Цена найдена (способ 2, паттерн {pattern}): {price}")
-                        return price
-                
-                # СПОСОБ 3: Ищем JSON данные в script тегах
-                logger.info("Способ 2 не сработал, пробую парсить JSON из скриптов...")
-                
-                scripts = soup.find_all('script', type='application/json')
-                for script in scripts:
+                # ГЛАВНОЕ: Ждем пока текст в элементе не будет непустым
+                # Это критично, так как элемент может быть пустым вначале
+                logger.info("⏳ Жду загрузки текста цены в элемент...")
+                max_attempts = 60  # Попыткаемся 60 раз
+                for attempt in range(max_attempts):
                     try:
-                        data = json.loads(script.string)
-                        # Рекурсивно ищем в JSON
-                        price = find_price_in_json(data)
-                        if price:
-                            logger.info(f"✅ Цена найдена (способ 3): {price}")
-                            return price
-                    except:
-                        pass
-                
-                # СПОСОБ 4: Последний шанс - ищем любое число с валютой
-                logger.info("Способ 3 не сработал, ищу последним способом...")
-                
-                for elem in soup.find_all(['div', 'span', 'p', 'h3', 'h4']):
-                    text = elem.get_text(strip=True)
-                    if text and any(curr in text for curr in ['грн', 'UAH', 'uah']):
-                        if any(char.isdigit() for char in text):
-                            # Очень вероятно это цена
-                            price = ''.join(filter(lambda x: x.isdigit() or x in ',.', text.replace(' ', '')))
-                            if price and len(price) > 2:  # Минимум 3 цифры
+                        price_text = await page.text_content('.jsTourPrice', timeout=1000)
+                        
+                        if price_text and price_text.strip():
+                            # Текст загрузился!
+                            logger.info(f"✅ Цена загружена на попытке {attempt + 1}")
+                            price_text = price_text.strip()
+                            logger.info(f"Найденный текст цены: '{price_text}'")
+                            
+                            # Извлечь только цифры
+                            price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
+                            
+                            if price and price != '0':
                                 price = price.replace(',', '.')
-                                logger.info(f"✅ Цена найдена (способ 4): {price}")
+                                logger.info(f"✅ Цена успешно извлечена: {price}")
+                                await browser.close()
                                 return price
+                        else:
+                            logger.info(f"⏳ Попытка {attempt + 1}/{max_attempts}: текст еще пустой, жду...")
+                    except:
+                        logger.info(f"⏳ Попытка {attempt + 1}/{max_attempts}: элемент еще не готов, жду...")
+                    
+                    # Подожди перед следующей попыткой
+                    await asyncio.sleep(0.5)
                 
-                logger.warning("❌ Не удалось найти цену ни одним способом")
-                return None
-            else:
-                logger.error(f"❌ Ошибка HTTP {response.status}")
+                logger.warning("❌ Не удалось дождаться загрузки цены в течение отведенного времени")
+                await browser.close()
                 return None
                 
-    except asyncio.TimeoutError:
-        logger.error("❌ Таймаут при загрузке страницы")
-        return None
+            except Exception as e:
+                logger.error(f"❌ Ошибка при работе с страницей: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+                await browser.close()
+                return None
+                
     except Exception as e:
         logger.error(f"❌ Ошибка при получении цены: {e}")
         import traceback
         logger.error(traceback.format_exc())
+        if browser:
+            await browser.close()
         return None
-
-def find_price_in_json(data, max_depth=5):
-    """Рекурсивно ищет цену в JSON данных"""
-    if max_depth <= 0:
-        return None
-    
-    if isinstance(data, dict):
-        # Ищем ключи с "price", "cost", "tour"
-        for key, value in data.items():
-            if any(word in str(key).lower() for word in ['price', 'cost', 'tour', 'total', 'amount']):
-                if isinstance(value, (int, float)):
-                    return str(value)
-                elif isinstance(value, str) and value.replace('.', '').replace(',', '').isdigit():
-                    return value
-            # Рекурсивно ищем глубже
-            result = find_price_in_json(value, max_depth - 1)
-            if result:
-                return result
-    
-    elif isinstance(data, list):
-        for item in data:
-            result = find_price_in_json(item, max_depth - 1)
-            if result:
-                return result
-    
-    return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /start"""
@@ -257,15 +207,14 @@ async def add_hotel(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
     
     # Попытка получить цену для проверки URL
-    async with aiohttp.ClientSession() as session:
-        price = await fetch_hotel_price(session, url)
-        
-        if price is None:
-            await update.message.reply_text(
-                "⚠️ Не удалось получить цену с этого URL.\n"
-                "Пожалуйста, проверь ссылку и попробуй еще раз."
-            )
-            return
+    price = await fetch_hotel_price(url)
+    
+    if price is None:
+        await update.message.reply_text(
+            "⚠️ Не удалось получить цену с этого URL.\n"
+            "Пожалуйста, проверь ссылку и попробуй еще раз."
+        )
+        return
     
     hotel_id = tracker.add_hotel(user_id, url, hotel_name)
     tracker.update_price(user_id, hotel_id, price)
@@ -358,8 +307,8 @@ async def check_prices(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"     Была цена: {hotel_info.get('last_price', 'не определена')}")
             
             try:
-                async with aiohttp.ClientSession() as session:
-                    new_price = await fetch_hotel_price(session, url)
+                # Используй Playwright напрямую
+                new_price = await fetch_hotel_price(url)
                 
                 if new_price:
                     logger.info(f"     ✅ Новая цена: {new_price}")
@@ -429,16 +378,20 @@ def main():
     # Обработчик ошибок
     application.add_error_handler(error_handler)
     
-    # Добавить проверку цен через встроенный job_queue
-    application.job_queue.run_repeating(
+    # Планировщик для проверки цен каждый час
+    scheduler = AsyncIOScheduler()
+    scheduler.add_job(
         check_prices,
-        interval=3600,  # 3600 секунд = 1 час
-        first=30,  # Первая проверка через 30 секунд
-        name='check_prices_job',
-        chat_id=None
+        trigger=IntervalTrigger(hours=1),
+        args=(application.job_queue,),
+        id='check_prices_job',
+        name='Проверка цен каждый час',
+        replace_existing=True
     )
     
-    logger.info("✅ Планировщик проверки цен включен (каждый час)")
+    # Добавить scheduler в приложение
+    application.job_queue.scheduler = scheduler
+    scheduler._application = application
     
     # Запустить бот
     print("✅ Бот запущен! Нажми Ctrl+C для остановки.")
