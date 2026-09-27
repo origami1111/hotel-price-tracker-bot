@@ -9,8 +9,6 @@ from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
     ContextTypes, filters
 )
-from apscheduler.schedulers.asyncio import AsyncIOScheduler
-from apscheduler.triggers.interval import IntervalTrigger
 import logging
 
 # Настройка логирования
@@ -99,7 +97,7 @@ async def fetch_hotel_price(session, url):
                 # Попытаемся найти цену разными способами
                 price_elem = None
                 
-                # ✅ СПОСОБ 1: Искать по найденному селектору jsTourPrice
+                #  Искать по найденному селектору jsTourPrice
                 class_names = [
                     'jsTourPrice',      # ← Основной селектор (найден!)
                     'info-box__price',  # ← Альтернативный
@@ -268,37 +266,67 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def check_prices(context: ContextTypes.DEFAULT_TYPE):
     """Проверить цены на все отели всех пользователей"""
-    logger.info("🔍 Начало проверки цен...")
+    logger.info("=" * 60)
+    logger.info("🔍 НАЧАЛО ПРОВЕРКИ ЦЕН")
+    logger.info("=" * 60)
     
     for user_id, user_data in tracker.data.items():
-        for hotel_id, hotel_info in user_data.get('hotels', {}).items():
+        hotels = user_data.get('hotels', {})
+        logger.info(f"\n👤 Пользователь {user_id}: {len(hotels)} отелей")
+        
+        for hotel_id, hotel_info in hotels.items():
             url = hotel_info['url']
+            hotel_name = hotel_info['name']
+            
+            logger.info(f"\n  🏨 Проверяю: {hotel_name}")
+            logger.info(f"     URL: {url}")
+            logger.info(f"     Была цена: {hotel_info.get('last_price', 'не определена')}")
             
             try:
                 async with aiohttp.ClientSession() as session:
                     new_price = await fetch_hotel_price(session, url)
                 
                 if new_price:
+                    logger.info(f"     ✅ Новая цена: {new_price}")
                     old_price = tracker.update_price(user_id, hotel_id, new_price)
                     
                     # Если цена изменилась, отправить уведомление
                     if old_price and old_price != new_price:
+                        logger.info(f"     📊 ЦЕНА ИЗМЕНИЛАСЬ! {old_price} → {new_price}")
+                        
                         try:
+                            message = (
+                                f"🔔 <b>Цена изменилась!</b>\n\n"
+                                f"📍 <b>{hotel_name}</b>\n"
+                                f"❌ Была: <b>{old_price}</b>\n"
+                                f"✅ Стала: <b>{new_price}</b>\n"
+                                f"🔗 <a href='{url}'>Смотреть отель</a>"
+                            )
+                            
                             await context.bot.send_message(
                                 chat_id=int(user_id),
-                                text=(
-                                    f"🔔 Цена изменилась!\n\n"
-                                    f"📍 {hotel_info['name']}\n"
-                                    f"❌ Была: {old_price}\n"
-                                    f"✅ Стала: {new_price}\n"
-                                    f"🔗 {url}"
-                                )
+                                text=message,
+                                parse_mode='HTML'
                             )
-                            logger.info(f"Уведомление отправлено пользователю {user_id}")
+                            logger.info(f"     📨 ✅ Уведомление отправлено пользователю {user_id}")
                         except Exception as e:
-                            logger.error(f"Ошибка отправки сообщения: {e}")
+                            logger.error(f"     📨 ❌ Ошибка отправки сообщения: {e}")
+                    else:
+                        if old_price:
+                            logger.info(f"     ℹ️ Цена не изменилась ({old_price} == {new_price})")
+                        else:
+                            logger.info(f"     ℹ️ Первая проверка цены")
+                else:
+                    logger.warning(f"     ⚠️ Не удалось получить цену!")
+                    
             except Exception as e:
-                logger.error(f"Ошибка при проверке цены {url}: {e}")
+                logger.error(f"     ❌ Ошибка при проверке цены: {e}")
+                import traceback
+                logger.error(traceback.format_exc())
+    
+    logger.info("\n" + "=" * 60)
+    logger.info("✅ ПРОВЕРКА ЦЕН ЗАВЕРШЕНА")
+    logger.info("=" * 60)
 
 async def error_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Обработчик ошибок"""
@@ -326,20 +354,16 @@ def main():
     # Обработчик ошибок
     application.add_error_handler(error_handler)
     
-    # Планировщик для проверки цен каждый час
-    scheduler = AsyncIOScheduler()
-    scheduler.add_job(
+    # Добавить проверку цен через встроенный job_queue
+    application.job_queue.run_repeating(
         check_prices,
-        trigger=IntervalTrigger(hours=1),
-        args=(application.job_queue,),
-        id='check_prices_job',
-        name='Проверка цен каждый час',
-        replace_existing=True
+        interval=3600,  # 3600 секунд = 1 час
+        first=30,  # Первая проверка через 30 секунд
+        name='check_prices_job',
+        chat_id=None
     )
     
-    # Добавить scheduler в приложение
-    application.job_queue.scheduler = scheduler
-    scheduler._application = application
+    logger.info("✅ Планировщик проверки цен включен (каждый час)")
     
     # Запустить бот
     print("✅ Бот запущен! Нажми Ctrl+C для остановки.")
