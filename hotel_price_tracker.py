@@ -2,6 +2,7 @@ import os
 import json
 import asyncio
 from datetime import datetime
+from bs4 import BeautifulSoup
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application, CommandHandler, MessageHandler, CallbackQueryHandler,
@@ -10,7 +11,8 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import logging
-from playwright.async_api import async_playwright
+from requests_html import HTMLSession
+import time
 
 # Настройка логирования
 logging.basicConfig(
@@ -85,80 +87,72 @@ class HotelPriceTracker:
 tracker = HotelPriceTracker()
 
 async def fetch_hotel_price(url):
-    """Получить цену отеля - использует Playwright для загрузки и ожидания JavaScript"""
-    browser = None
+    """Получить цену отеля - использует requests-html для загрузки JavaScript"""
     try:
-        logger.info(f"📡 Загружаю страницу Playwright: {url}")
+        logger.info(f"📡 Загружаю страницу: {url}")
         
-        async with async_playwright() as p:
-            # Запусти браузер в headless режиме
-            browser = await p.chromium.launch(
-                headless=True, 
-                args=['--no-sandbox', '--disable-dev-shm-usage']
-            )
-            page = await browser.new_page()
+        # Используй requests-html с JavaScript рендерингом
+        session = HTMLSession()
+        
+        try:
+            # Загрузи страницу с выполнением JavaScript
+            logger.info("⏳ Рендерю JavaScript...")
+            response = session.get(url, timeout=60)
             
-            try:
-                # Загрузи страницу
-                await page.goto(url, wait_until='networkidle')
-                logger.info("✅ Страница загружена")
+            # Выполни JavaScript и ждём загрузки
+            logger.info("⏳ Жду загрузки контента...")
+            response.html.render(sleep=25, timeout=60)  # Подожди 2 секунды на загрузку
+            logger.info("✅ Страница загружена и отрендерена")
+            
+            # Ищем элемент с ценой
+            price_elem = response.html.find('.jsTourPrice', first=True)
+            
+            if price_elem:
+                price_text = price_elem.text.strip()
+                logger.info(f"Найден элемент .jsTourPrice, текст: '{price_text}'")
                 
-                # КЛЮЧЕВОЙ МОМЕНТ: Ждем пока цена не загрузится в элемент
-                # Сначала ждем чтобы элемент появился
-                logger.info("⏳ Жду появления элемента .jsTourPrice...")
-                try:
-                    await page.wait_for_selector('.jsTourPrice', timeout=10000)
-                    logger.info("✅ Элемент .jsTourPrice найден")
-                except:
-                    logger.warning("⚠️ Элемент .jsTourPrice не найден, попробую искать альтернативные селекторы")
-                
-                # ГЛАВНОЕ: Ждем пока текст в элементе не будет непустым
-                # Это критично, так как элемент может быть пустым вначале
-                logger.info("⏳ Жду загрузки текста цены в элемент...")
-                max_attempts = 60  # Попыткаемся 60 раз
-                for attempt in range(max_attempts):
-                    try:
-                        price_text = await page.text_content('.jsTourPrice', timeout=1000)
-                        
-                        if price_text and price_text.strip():
-                            # Текст загрузился!
-                            logger.info(f"✅ Цена загружена на попытке {attempt + 1}")
-                            price_text = price_text.strip()
-                            logger.info(f"Найденный текст цены: '{price_text}'")
-                            
-                            # Извлечь только цифры
-                            price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
-                            
-                            if price and price != '0':
-                                price = price.replace(',', '.')
-                                logger.info(f"✅ Цена успешно извлечена: {price}")
-                                await browser.close()
-                                return price
-                        else:
-                            logger.info(f"⏳ Попытка {attempt + 1}/{max_attempts}: текст еще пустой, жду...")
-                    except:
-                        logger.info(f"⏳ Попытка {attempt + 1}/{max_attempts}: элемент еще не готов, жду...")
+                if price_text:  # Если не пустой
+                    # Извлечь числа
+                    price = ''.join(filter(lambda x: x.isdigit() or x in ',.', price_text.replace(' ', '')))
                     
-                    # Подожди перед следующей попыткой
-                    await asyncio.sleep(0.5)
-                
-                logger.warning("❌ Не удалось дождаться загрузки цены в течение отведенного времени")
-                await browser.close()
-                return None
-                
-            except Exception as e:
-                logger.error(f"❌ Ошибка при работе с страницей: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
-                await browser.close()
-                return None
+                    if price and price != '0':
+                        price = price.replace(',', '.')
+                        logger.info(f"✅ Цена найдена: {price}")
+                        session.close()
+                        return price
+            
+            # Если первый способ не сработал, ищем число с валютой
+            logger.info("Способ 1 не сработал, ищу последним способом...")
+            
+            html_content = response.html.html
+            soup = BeautifulSoup(html_content, 'html.parser')
+            
+            for elem in soup.find_all(['div', 'span', 'p']):
+                text = elem.get_text(strip=True)
+                if text and any(curr in text for curr in ['грн', 'UAH', 'uah']):
+                    if any(char.isdigit() for char in text):
+                        price = ''.join(filter(lambda x: x.isdigit() or x in ',.', text.replace(' ', '')))
+                        if price and len(price) > 2 and price != '0':
+                            price = price.replace(',', '.')
+                            logger.info(f"✅ Цена найдена (способ 2): {price}")
+                            session.close()
+                            return price
+            
+            logger.warning("❌ Не удалось найти цену")
+            session.close()
+            return None
+            
+        except Exception as e:
+            logger.error(f"❌ Ошибка при загрузке/рендеринге: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            session.close()
+            return None
                 
     except Exception as e:
         logger.error(f"❌ Ошибка при получении цены: {e}")
         import traceback
         logger.error(traceback.format_exc())
-        if browser:
-            await browser.close()
         return None
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
