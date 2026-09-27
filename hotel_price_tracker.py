@@ -11,8 +11,7 @@ from telegram.ext import (
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 import logging
-from requests_html import HTMLSession
-import time
+from requests_html import AsyncHTMLSession
 
 # Настройка логирования
 logging.basicConfig(
@@ -87,21 +86,21 @@ class HotelPriceTracker:
 tracker = HotelPriceTracker()
 
 async def fetch_hotel_price(url):
-    """Получить цену отеля - использует requests-html для загрузки JavaScript"""
+    """Получить цену отеля - использует AsyncHTMLSession для загрузки JavaScript"""
     try:
         logger.info(f"📡 Загружаю страницу: {url}")
         
-        # Используй requests-html с JavaScript рендерингом
-        session = HTMLSession()
+        # Используй AsyncHTMLSession для работы в async контексте
+        session = AsyncHTMLSession()
         
         try:
             # Загрузи страницу с выполнением JavaScript
             logger.info("⏳ Рендерю JavaScript...")
-            response = session.get(url, timeout=60)
+            response = await session.get(url, timeout=60)
             
             # Выполни JavaScript и ждём загрузки
             logger.info("⏳ Жду загрузки контента...")
-            response.html.render(sleep=25, timeout=60)  # Подожди 2 секунды на загрузку
+            await response.html.arender(sleep=30, timeout=60)  # Используй arender для async
             logger.info("✅ Страница загружена и отрендерена")
             
             # Ищем элемент с ценой
@@ -118,7 +117,7 @@ async def fetch_hotel_price(url):
                     if price and price != '0':
                         price = price.replace(',', '.')
                         logger.info(f"✅ Цена найдена: {price}")
-                        session.close()
+                        await session.close()
                         return price
             
             # Если первый способ не сработал, ищем число с валютой
@@ -135,18 +134,21 @@ async def fetch_hotel_price(url):
                         if price and len(price) > 2 and price != '0':
                             price = price.replace(',', '.')
                             logger.info(f"✅ Цена найдена (способ 2): {price}")
-                            session.close()
+                            await session.close()
                             return price
             
             logger.warning("❌ Не удалось найти цену")
-            session.close()
+            await session.close()
             return None
             
         except Exception as e:
             logger.error(f"❌ Ошибка при загрузке/рендеринге: {e}")
             import traceback
             logger.error(traceback.format_exc())
-            session.close()
+            try:
+                await session.close()
+            except:
+                pass
             return None
                 
     except Exception as e:
@@ -300,7 +302,7 @@ async def check_prices(context: ContextTypes.DEFAULT_TYPE):
             logger.info(f"     Была цена: {hotel_info.get('last_price', 'не определена')}")
             
             try:
-                # Используй Playwright напрямую
+                # Используй fetch_hotel_price напрямую
                 new_price = await fetch_hotel_price(url)
                 
                 if new_price:
